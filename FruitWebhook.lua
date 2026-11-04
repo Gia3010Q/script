@@ -17,12 +17,20 @@
     Cấu hình nhanh trước khi chạy (tùy chọn):
       getgenv().WebhookURL = "https://discord.com/api/webhooks/..."
       getgenv().WebhookOnlyFruit = "Gas" -- Mặc định chỉ nhận Hellfire (Gas) Fruit. Đặt "All" nếu muốn nhận tất cả.
+      getgenv().WebhookPing = "@everyone" -- Mặc định ping @everyone khi có thông báo
       getgenv().WebhookMinRarity = "All" -- "All" | "Common" | "Uncommon" | "Rare" | "Legendary" | "Mythical"
+      getgenv().AutoStore = true         -- Tự động lưu trái vào rương càng nhanh càng tốt
+      getgenv().MaxStoreAttempts = 2     -- Thử tối đa 2 lần, nếu không thể lưu thì bỏ qua hoàn toàn
+      getgenv().StoreRetryDelay = 0.3    -- Thử lại cực nhanh (0.3s) giữa 2 lần thử
 
     Hoặc cấu hình đầy đủ bằng bảng:
       getgenv().FruitWebhookConfig = {
           WebhookURL = "https://discord.com/api/webhooks/...",
           OnlyFruit = "Gas", -- Chỉ nhận Hellfire / Gas Fruit (hoặc "All")
+          Ping = "@everyone", -- Mặc định ping @everyone
+          AutoStore = true,  -- Tự động lưu trái vào rương
+          MaxStoreAttempts = 2,  -- Tối đa 2 lần thử, thất bại bỏ qua hoàn toàn
+          StoreRetryDelay = 0.3, -- Delay thử lại cực nhanh (giây)
           Enabled = true,
           OnHolding = true, -- Thông báo khi cầm trái trên tay
           OnPickup = true,  -- Thông báo khi nhặt trái
@@ -33,7 +41,6 @@
           Title = "🔥 Noti Hellfire (Gas) Fruit",
           FooterText = "Dev By Gia Yêu Em",
           Color = 16711765, -- Màu đỏ Ruby Mythical
-          Ping = "",   -- Ví dụ: "@everyone" hoặc "@here" hoặc "<@&ROLE_ID>"
           AvatarURL = "",
           BannerURL = "",
           AutoDetect = true, -- Tự động bắt sự kiện khi chạy độc lập
@@ -55,11 +62,14 @@ local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 
--- Cấu hình mặc định: Mặc định lọc riêng trái Hellfire (Gas) Fruit
+-- Cấu hình mặc định: Mặc định lọc riêng trái Hellfire (Gas) Fruit & Auto Store siêu tốc
 local defaults = {
     Enabled = true,
     WebhookURL = "",
     OnlyFruit = "Gas", -- "Gas" (Hellfire / Gas Fruit) hoặc "All" để nhận tất cả các trái
+    AutoStore = true,  -- Tự động lưu trái vào rương càng nhanh càng tốt
+    MaxStoreAttempts = 2,  -- Tối đa 2 lần thử, nếu thất bại bỏ qua hoàn toàn
+    StoreRetryDelay = 0.3, -- Thời gian chờ thử lại (0.3 giây)
     OnHolding = true,
     OnPickup = true,
     OnRandom = true,
@@ -69,7 +79,7 @@ local defaults = {
     Title = "🔥 Noti Hellfire (Gas) Fruit",
     FooterText = "Dev By Gia Yêu Em",
     Color = nil, -- nil = tự dùng màu Rarity (Đỏ Ruby cho Gas/Hellfire Mythical)
-    Ping = "",
+    Ping = "@everyone", -- Mặc định ping @everyone khi có thông báo
     AvatarURL = "",
     BannerURL = "",
     AutoDetect = true,
@@ -97,6 +107,11 @@ end
 if type(env.WebhookMinRarity) == "string" and env.WebhookMinRarity ~= "" then
     config.MinRarity = env.WebhookMinRarity
 end
+if env.AutoStore ~= nil then config.AutoStore = env.AutoStore end
+if env.StoreFruit ~= nil then config.AutoStore = env.StoreFruit end
+if tonumber(env.MaxStoreAttempts) then config.MaxStoreAttempts = tonumber(env.MaxStoreAttempts) end
+if tonumber(env.StoreAttempts) then config.MaxStoreAttempts = tonumber(env.StoreAttempts) end
+if tonumber(env.StoreRetryDelay) then config.StoreRetryDelay = tonumber(env.StoreRetryDelay) end
 if env.WebhookEnabled ~= nil then config.Enabled = env.WebhookEnabled end
 if env.WebhookOnHolding ~= nil then config.OnHolding = env.WebhookOnHolding end
 if env.WebhookOnPickup ~= nil then config.OnPickup = env.WebhookOnPickup end
@@ -407,16 +422,18 @@ function controller.Send(eventType, fruitName, tool, storageName)
         embed.thumbnail = { url = banner }
     end
 
+    local pingContent = env.WebhookPing ~= nil and tostring(env.WebhookPing) or config.Ping
+    if pingContent == nil or (pingContent == "" and config.Ping ~= "") then
+        pingContent = config.Ping
+    end
+    pingContent = tostring(pingContent or ""):match("^%s*(.-)%s*$")
+
     local payload = {
-        content = tostring(config.Ping or ""),
+        content = pingContent,
         username = config.Username,
         embeds = { embed },
-        allowed_mentions = { parse = {} },
+        allowed_mentions = { parse = { "everyone", "users", "roles" } },
     }
-
-    if config.Ping == "@everyone" or config.Ping == "@here" then
-        payload.allowed_mentions = { parse = { "everyone" } }
-    end
 
     local avatar = tostring(config.AvatarURL or ""):match("^%s*(.-)%s*$")
     if avatar:match("^https://") then
@@ -467,6 +484,112 @@ task.spawn(function()
     end
 end)
 
+-- =====================================================================
+-- HỆ THỐNG AUTO STORE TRÁI VÀO RƯƠNG CỰC NHANH (FAST AUTO STORE)
+-- =====================================================================
+local storeInProgress = setmetatable({}, { __mode = "k" })
+local storeAttempts = setmetatable({}, { __mode = "k" })
+local ignoredStoreTools = setmetatable({}, { __mode = "k" })
+
+local function getCommF()
+    local remotes = RS:FindFirstChild("Remotes")
+    return remotes and remotes:FindFirstChild("CommF_")
+end
+
+local function isStillOwned(tool)
+    if not tool or not tool.Parent then return false end
+    local bp = player:FindFirstChildOfClass("Backpack")
+    local char = player.Character
+    return (bp and tool:IsDescendantOf(bp)) or (char and tool:IsDescendantOf(char))
+end
+
+local function getFruitStorageName(item)
+    if not item then return nil end
+    local orig = getFruitOriginalName(item)
+    if orig and orig ~= "" then return orig end
+
+    local clean = tostring(item.Name or ""):gsub("%s+[Ff][Rr][Uu][Ii][Tt]$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if clean ~= "" then
+        return clean .. "-" .. clean
+    end
+    return nil
+end
+
+local function tryStoreFruit(tool)
+    if not config.AutoStore then return end
+    if not tool or not isFruitTool(tool) then return end
+    if ignoredStoreTools[tool] or storeInProgress[tool] then return end
+
+    local attempts = (storeAttempts[tool] or 0) + 1
+    storeAttempts[tool] = attempts
+
+    if attempts > config.MaxStoreAttempts then
+        ignoredStoreTools[tool] = true
+        log("STORE", string.format("Bo qua hoan toan trai '%s' (da vuot qua %d lan thu)", tool.Name, config.MaxStoreAttempts))
+        return
+    end
+
+    local commF = getCommF()
+    if not commF then
+        log("STORE_ERR", "Khong tim thay Remotes.CommF_ de luu trai")
+        return
+    end
+
+    local storageName = getFruitStorageName(tool)
+    if not storageName then
+        log("STORE_ERR", "Chua xac dinh duoc StorageName cho " .. tool.Name)
+        return
+    end
+
+    storeInProgress[tool] = true
+
+    task.spawn(function()
+        local toolName = tool.Name
+        log("STORE", string.format("⚡ Dang luu '%s' vao ruong (Lan %d/%d)...", toolName, attempts, config.MaxStoreAttempts))
+
+        -- Nếu trái đang cầm trên tay, unequip về balo để Remote StoreFruit luôn thành công
+        if tool.Parent == player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+            pcall(function() player.Character:FindFirstChildOfClass("Humanoid"):UnequipTools() end)
+            task.wait(0.05)
+        end
+
+        -- Gửi remote StoreFruit ngay lập tức
+        local ok, res = pcall(function()
+            return commF:InvokeServer("StoreFruit", storageName, tool)
+        end)
+
+        -- Kiểm tra cực nhanh (mỗi 0.05s, tối đa 0.3s) xem Tool đã vào rương chưa
+        local storedConfirmed = false
+        for _ = 1, 6 do
+            if not isStillOwned(tool) then
+                storedConfirmed = true
+                break
+            end
+            task.wait(0.05)
+        end
+
+        storeInProgress[tool] = nil
+
+        if storedConfirmed then
+            log("SUCCESS", string.format("✅ Da luu '%s' vao ruong thanh cong!", toolName))
+            controller.Send("Stored", toolName, tool, storageName)
+        else
+            log("WARN", string.format("❌ Luu '%s' that bai (Lan %d/%d)", toolName, attempts, config.MaxStoreAttempts))
+            if attempts >= config.MaxStoreAttempts then
+                ignoredStoreTools[tool] = true
+                log("STORE", string.format("⛔ Bo qua hoan toan trai '%s' sau %d lan thu that bai (kho day hoac da co)!", toolName, config.MaxStoreAttempts))
+            else
+                -- Thử lại cực nhanh sau StoreRetryDelay (0.3s)
+                task.delay(config.StoreRetryDelay, function()
+                    if controller.Alive and isStillOwned(tool) and not ignoredStoreTools[tool] then
+                        tryStoreFruit(tool)
+                    end
+                end)
+            end
+        end
+    end)
+end
+
 -- Tự động bắt sự kiện khi chạy độc lập (Standalone AutoDetect)
 local function setupAutoDetect()
     if not config.AutoDetect then return end
@@ -497,13 +620,19 @@ local function setupAutoDetect()
 
         -- Tránh thông báo trùng lặp cho cùng một Tool instance và eventType
         handledInstances[tool] = handledInstances[tool] or {}
-        if handledInstances[tool][eventType] then return end
-        handledInstances[tool][eventType] = true
+        if not handledInstances[tool][eventType] then
+            handledInstances[tool][eventType] = true
 
-        task.delay(0.15, function()
-            if not controller.Alive or not tool:IsDescendantOf(game) then return end
-            controller.Send(eventType, tool.Name, tool, getFruitOriginalName(tool))
-        end)
+            task.delay(0.1, function()
+                if not controller.Alive or not tool:IsDescendantOf(game) then return end
+                controller.Send(eventType, tool.Name, tool, getFruitOriginalName(tool))
+            end)
+        end
+
+        -- Tự động cất trái vào rương càng nhanh càng tốt
+        if config.AutoStore and not ignoredStoreTools[tool] and not storeInProgress[tool] then
+            task.spawn(tryStoreFruit, tool)
+        end
     end
 
     local function scanAndListen(container, isHand)
@@ -556,7 +685,7 @@ local function setupAutoDetect()
     -- Đảm bảo không bao giờ bỏ sót trái trên tay kể cả khi executor bắt sự kiện ChildAdded bị chậm hoặc lag
     task.spawn(function()
         while controller.Alive do
-            task.wait(1.5)
+            task.wait(1)
             if not controller.Alive then break end
 
             -- Kiểm tra trái trên tay (Character)
@@ -567,6 +696,8 @@ local function setupAutoDetect()
                         handledInstances[item] = handledInstances[item] or {}
                         if not handledInstances[item]["Holding"] then
                             handleFruitFound(item, true)
+                        elseif config.AutoStore and not ignoredStoreTools[item] and not storeInProgress[item] then
+                            tryStoreFruit(item)
                         end
                     end
                 end
@@ -580,6 +711,8 @@ local function setupAutoDetect()
                         handledInstances[item] = handledInstances[item] or {}
                         if not handledInstances[item]["Picked"] and not handledInstances[item]["Random"] then
                             handleFruitFound(item, false)
+                        elseif config.AutoStore and not ignoredStoreTools[item] and not storeInProgress[item] then
+                            tryStoreFruit(item)
                         end
                     end
                 end
@@ -619,12 +752,15 @@ function controller.GetQueueCount()
 end
 
 -- Xuất biến toàn cục để các script khác (EvenMagnetFarm, v.v.) gọi trực tiếp
+controller.StoreFruit = tryStoreFruit
+controller.GetIgnoredFruits = function() return ignoredStoreTools end
+env.StoreFruit = tryStoreFruit
 env.SendFruitWebhook = function(eventType, fruitName, tool, storageName)
     controller.Send(eventType, fruitName, tool, storageName)
 end
 env.FruitWebhookNotifier = controller
 env.FruitWebhookController = controller
 
-log("INFO", string.format("FruitWebhook da san sang. Muc tieu: '%s' | MinRarity: '%s'. Dang quet trai tren tay va tui do...", tostring(env.WebhookOnlyFruit or config.OnlyFruit), tostring(env.WebhookMinRarity or config.MinRarity)))
+log("INFO", string.format("FruitWebhook da san sang. Muc tieu: '%s' | AutoStore: %s (Max %d lan thu) | MinRarity: '%s'. Dang quet trai...", tostring(env.WebhookOnlyFruit or config.OnlyFruit), tostring(config.AutoStore and "ON" or "OFF"), config.MaxStoreAttempts, tostring(env.WebhookMinRarity or config.MinRarity)))
 
 return controller
