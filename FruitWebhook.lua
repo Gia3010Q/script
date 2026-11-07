@@ -16,7 +16,8 @@
 
     Cấu hình nhanh trước khi chạy (tùy chọn):
       getgenv().WebhookURL = "https://discord.com/api/webhooks/..."
-      getgenv().WebhookOnlyFruit = "Gas" -- Mặc định chỉ nhận Hellfire (Gas) Fruit. Đặt "All" nếu muốn nhận tất cả.
+      getgenv().WebhookOnlyFruit = "Gas" -- Trái mục tiêu; mặc định báo thêm các trái Mythical.
+      getgenv().WebhookIncludeMythical = true -- Đặt false để chỉ dùng bộ lọc cũ.
       getgenv().WebhookPing = "@everyone" -- Mặc định ping @everyone khi có thông báo
       getgenv().WebhookMinRarity = "All" -- "All" | "Common" | "Uncommon" | "Rare" | "Legendary" | "Mythical"
       getgenv().AutoStore = true         -- Tự động lưu trái vào rương càng nhanh càng tốt
@@ -26,7 +27,8 @@
     Hoặc cấu hình đầy đủ bằng bảng:
       getgenv().FruitWebhookConfig = {
           WebhookURL = "https://discord.com/api/webhooks/...",
-          OnlyFruit = "Gas", -- Chỉ nhận Hellfire / Gas Fruit (hoặc "All")
+          OnlyFruit = "Gas", -- Hellfire / Gas Fruit (hoặc "All")
+          IncludeMythical = true,
           Ping = "@everyone", -- Mặc định ping @everyone
           AutoStore = true,  -- Tự động lưu trái vào rương
           MaxStoreAttempts = 2,  -- Tối đa 2 lần thử, thất bại bỏ qua hoàn toàn
@@ -38,7 +40,7 @@
           OnStore = true,   -- Thông báo khi cất rương
           MinRarity = "All", -- "All" | "Legendary" | "Mythical" ...
           Username = "Noti Fruit",
-          Title = "🔥 Noti Hellfire (Gas) Fruit",
+          Title = "Noti Fruit",
           FooterText = "Dev By Gia Yêu Em",
           Color = 16711765, -- Màu đỏ Ruby Mythical
           AvatarURL = "",
@@ -62,11 +64,12 @@ local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 
--- Cấu hình mặc định: Mặc định lọc riêng trái Hellfire (Gas) Fruit & Auto Store siêu tốc
+-- Mặc định báo Gas/Hellfire và mọi trái được nhận diện là Mythical.
 local defaults = {
     Enabled = true,
     WebhookURL = "",
     OnlyFruit = "Gas", -- "Gas" (Hellfire / Gas Fruit) hoặc "All" để nhận tất cả các trái
+    IncludeMythical = true,
     AutoStore = true,  -- Tự động lưu trái vào rương càng nhanh càng tốt
     MaxStoreAttempts = 2,  -- Tối đa 2 lần thử, nếu thất bại bỏ qua hoàn toàn
     StoreRetryDelay = 0.3, -- Thời gian chờ thử lại (0.3 giây)
@@ -76,7 +79,7 @@ local defaults = {
     OnStore = true,
     MinRarity = "All", -- Nhận tất cả trái phù hợp với OnlyFruit
     Username = "Noti Fruit",
-    Title = "🔥 Noti Hellfire (Gas) Fruit",
+    Title = "Noti Fruit",
     FooterText = "Dev By Gia Yêu Em",
     Color = nil, -- nil = tự dùng màu Rarity (Đỏ Ruby cho Gas/Hellfire Mythical)
     Ping = "@everyone", -- Mặc định ping @everyone khi có thông báo
@@ -107,6 +110,7 @@ end
 if type(env.WebhookMinRarity) == "string" and env.WebhookMinRarity ~= "" then
     config.MinRarity = env.WebhookMinRarity
 end
+if type(env.WebhookIncludeMythical) == "boolean" then config.IncludeMythical = env.WebhookIncludeMythical end
 if env.AutoStore ~= nil then config.AutoStore = env.AutoStore end
 if env.StoreFruit ~= nil then config.AutoStore = env.StoreFruit end
 if tonumber(env.MaxStoreAttempts) then config.MaxStoreAttempts = tonumber(env.MaxStoreAttempts) end
@@ -250,29 +254,21 @@ local function isFruitTool(item)
 end
 
 local function getFruitRarity(name, storageName)
-    local wanted = fruitIdentity(storageName or name)
-    if type(fruitInfoList) == "table" then
+    local function lookup(id)
+        if id == "" or type(fruitInfoList) ~= "table" then return nil end
         for key, row in pairs(fruitInfoList) do
-            if type(key) == "string" and fruitIdentity(key) == wanted and type(row) == "table" then
+            if type(key) == "string" and fruitIdentity(key) == id and type(row) == "table" then
                 local rarity = type(row.Rarity) == "table" and row.Rarity.Name or row.Rarity
+                if typeof(rarity) == "EnumItem" then rarity = rarity.Name end
                 if type(rarity) == "string" and tiers[rarity:lower()] then
-                    local level = tiers[rarity:lower()]
-                    return level, RARITY_DATA[level] or RARITY_DATA[0]
+                    return tiers[rarity:lower()]
                 end
             end
         end
     end
-
-    local fallbackLevel = fallbackTiers[wanted]
-    if not fallbackLevel then
-        for key, level in pairs(fallbackTiers) do
-            if wanted:find(key, 1, true) then
-                fallbackLevel = level
-                break
-            end
-        end
-    end
-    local level = fallbackLevel or 0
+    local stored, display = fruitIdentity(storageName), fruitIdentity(name)
+    local level = lookup(stored) or (stored ~= display and lookup(display))
+        or fallbackTiers[stored] or fallbackTiers[display] or 0
     return level, RARITY_DATA[level] or RARITY_DATA[0]
 end
 
@@ -327,7 +323,8 @@ function controller.Send(eventType, fruitName, tool, storageName)
 
     -- Bộ lọc chỉ định trái mục tiêu (Ví dụ: Hellfire / Gas Fruit)
     local targetFruit = tostring(env.WebhookOnlyFruit or env.OnlyFruit or config.OnlyFruit or ""):lower():match("^%s*(.-)%s*$")
-    if targetFruit ~= "" and targetFruit ~= "all" then
+    local notifyMythical = config.IncludeMythical == true and level == tiers.mythical
+    if not notifyMythical and targetFruit ~= "" and targetFruit ~= "all" then
         local fName = cleanName:lower()
         local sName = tostring(realStorage or ""):lower()
         local id = fruitIdentity(cleanName):lower()
